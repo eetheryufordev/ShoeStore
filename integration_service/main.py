@@ -1,11 +1,12 @@
 
 from pathlib import Path as FilePath
 
-from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.staticfiles import StaticFiles
 import httpx
 
-from product_service.schemas import ProductCreate
+from fastapi.middleware.cors import CORSMiddleware
+from product_service.schemas import ProductCreate, ProductUpdate
 from category_service.schemas import CategoryCreate, CategoryUpdate
 from order_service.main import (
     OrderCreateRequest,
@@ -19,6 +20,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 STORAGE_DIRECTORY = FilePath(__file__).resolve().parent.parent / "storage"
 app.mount(
     "/storage",
@@ -29,7 +38,6 @@ app.mount(
 PRODUCT_SERVICE_URL = "http://127.0.0.1:8001"
 ORDER_SERVICE_URL = "http://127.0.0.1:8002"
 CATEGORY_SERVICE_URL = "http://127.0.0.1:8003"
-
 
 
 def forward_request(
@@ -161,22 +169,54 @@ def get_product(product_id: int):
     return forward_request("GET", f"/products/{product_id}")
 
 
-@app.post("/products")
-def create_product(product: ProductCreate):
-    return forward_request(
-        "POST",
-        "/products",
-        json=product.model_dump(mode="json")
-    )
+async def parse_product_payload(request: Request):
+    import uuid
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        payload = {}
+        for field in ("name", "description", "image_url"):
+            val = form.get(field)
+            if val is not None and str(val).strip():
+                payload[field] = str(val).strip()
+
+        if form.get("price") is not None and str(form.get("price")).strip():
+            payload["price"] = float(form.get("price"))
+        if form.get("stock") is not None and str(form.get("stock")).strip():
+            payload["stock"] = int(form.get("stock"))
+        if form.get("category_id") is not None and str(form.get("category_id")).strip():
+            payload["category_id"] = int(form.get("category_id"))
+
+        image_file = form.get("image")
+        if image_file and hasattr(image_file, "filename") and image_file.filename:
+            ext = FilePath(image_file.filename).suffix.lower()
+            if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                ext = ".png"
+            filename = f"prod_{uuid.uuid4().hex[:12]}{ext}"
+            target_dir = STORAGE_DIRECTORY / "images" / "products"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / filename
+            content = await image_file.read()
+            if len(content) > 0:
+                with open(target_path, "wb") as f:
+                    f.write(content)
+                payload["image_url"] = f"/storage/images/products/{filename}"
+
+        return payload
+    else:
+        return await request.json()
+
+
+@app.post("/products", status_code=201)
+async def create_product(request: Request):
+    payload = await parse_product_payload(request)
+    return forward_request("POST", "/products", json=payload)
 
 
 @app.put("/products/{product_id}")
-def update_product(product_id: int, product: ProductCreate):
-    return forward_request(
-        "PUT",
-        f"/products/{product_id}",
-        json=product.model_dump(mode="json")
-    )
+async def update_product(product_id: int, request: Request):
+    payload = await parse_product_payload(request)
+    return forward_request("PUT", f"/products/{product_id}", json=payload)
 
 
 @app.delete("/products/{product_id}")
