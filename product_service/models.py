@@ -7,9 +7,11 @@ from sqlalchemy import (
     DECIMAL,
     TIMESTAMP,
     ForeignKey,
+    UniqueConstraint,
     text,
     func,
 )
+from sqlalchemy.orm import relationship
 from product_service.database import Base
 
 
@@ -51,3 +53,36 @@ class Product(Base):
         server_default=text("CURRENT_TIMESTAMP"),
         onupdate=func.current_timestamp(),
     )
+    variants = relationship(
+        "ProductVariant",
+        back_populates="product",
+        cascade="all, delete-orphan",
+    )
+
+
+class ProductVariant(Base):
+    __tablename__ = "product_variants"
+    __table_args__ = (
+        UniqueConstraint("product_id", "size", name="uq_product_variant_size"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    product_id = Column(
+        Integer,
+        ForeignKey("products.id"),
+        nullable=False,
+    )
+    size = Column(String(20), nullable=False)
+    stock = Column(Integer, nullable=False, server_default=text("0"))
+    created_at = Column(
+        TIMESTAMP,
+        nullable=True,
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
+    updated_at = Column(
+        TIMESTAMP,
+        nullable=True,
+        server_default=text("CURRENT_TIMESTAMP"),
+        onupdate=func.current_timestamp(),
+    )
+    product = relationship("Product", back_populates="variants")

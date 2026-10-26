@@ -1,13 +1,20 @@
 
 from pathlib import Path as FilePath
 
-from fastapi import FastAPI, HTTPException, Path, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.staticfiles import StaticFiles
 import httpx
 
 from fastapi.middleware.cors import CORSMiddleware
-from product_service.schemas import ProductCreate, ProductUpdate
+from product_service.schemas import (
+    ProductCreate,
+    ProductUpdate,
+    ProductVariantCreate,
+    ProductVariantUpdate,
+)
 from category_service.schemas import CategoryCreate, CategoryUpdate
+from user_service.schemas import LoginRequest, UserCreate, UserRegister, UserUpdate
+from user_service.security import AUTHORIZATION_CONTEXT, require_role
 from order_service.main import (
     OrderCreateRequest,
     OrderStatus,
@@ -17,7 +24,8 @@ from order_service.main import (
 app = FastAPI(
     title="ShoeStore Integration Service",
     description="API trung gian kết nối các service",
-    version="1.0.0"
+    version="1.0.0",
+    dependencies=[Depends(require_role)],
 )
 
 app.add_middleware(
@@ -38,6 +46,17 @@ app.mount(
 PRODUCT_SERVICE_URL = "http://127.0.0.1:8001"
 ORDER_SERVICE_URL = "http://127.0.0.1:8002"
 CATEGORY_SERVICE_URL = "http://127.0.0.1:8003"
+USER_SERVICE_URL = "http://127.0.0.1:8004"
+
+
+@app.middleware("http")
+async def forward_authorization_header(request: Request, call_next):
+    authorization = request.headers.get("authorization")
+    token = AUTHORIZATION_CONTEXT.set(authorization)
+    try:
+        return await call_next(request)
+    finally:
+        AUTHORIZATION_CONTEXT.reset(token)
 
 
 def forward_request(
@@ -48,10 +67,15 @@ def forward_request(
     **kwargs
 ):
     try:
+        headers = dict(kwargs.pop("headers", {}))
+        authorization = AUTHORIZATION_CONTEXT.get()
+        if authorization:
+            headers["Authorization"] = authorization
         response = httpx.request(
             method,
             f"{base_url}{path}",
             timeout=10.0,
+            headers=headers,
             **kwargs
         )
         response.raise_for_status()
@@ -101,6 +125,16 @@ def forward_category_request(method: str, path: str, **kwargs):
     )
 
 
+def forward_user_request(method: str, path: str, **kwargs):
+    return forward_request(
+        method,
+        path,
+        base_url=USER_SERVICE_URL,
+        service_name="User Service",
+        **kwargs
+    )
+
+
 @app.get("/")
 def home():
     return {"message": "ShoeStore Integration Service is running"}
@@ -112,6 +146,71 @@ def health():
         "status": "ok",
         "service": "integration_service"
     }
+
+
+@app.post("/auth/login")
+def login(login_data: LoginRequest):
+    return forward_user_request(
+        "POST",
+        "/auth/login",
+        json=login_data.model_dump()
+    )
+
+
+@app.post("/auth/register", status_code=201)
+def register(user: UserRegister):
+    return forward_user_request(
+        "POST",
+        "/auth/register",
+        json=user.model_dump(mode="json")
+    )
+
+
+@app.get("/auth/me")
+def get_current_user():
+    return forward_user_request("GET", "/auth/me")
+
+
+# ---------------------- Users ----------------------
+
+@app.get("/users")
+def get_users(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500)
+):
+    return forward_user_request(
+        "GET",
+        "/users",
+        params={"skip": skip, "limit": limit}
+    )
+
+
+@app.get("/users/{user_id}")
+def get_user(user_id: int = Path(gt=0)):
+    return forward_user_request("GET", f"/users/{user_id}")
+
+
+@app.post("/users", status_code=201)
+def create_user(user: UserCreate):
+    return forward_user_request(
+        "POST",
+        "/users",
+        json=user.model_dump(mode="json")
+    )
+
+
+@app.put("/users/{user_id}")
+def update_user(user: UserUpdate, user_id: int = Path(gt=0)):
+    return forward_user_request(
+        "PUT",
+        f"/users/{user_id}",
+        json=user.model_dump(mode="json", exclude_unset=True)
+    )
+
+
+@app.delete("/users/{user_id}")
+def delete_user(user_id: int = Path(gt=0)):
+    return forward_user_request("DELETE", f"/users/{user_id}")
 
 
 # ---------------------- Categories ----------------------
@@ -224,6 +323,41 @@ def delete_product(product_id: int):
     return forward_request("DELETE", f"/products/{product_id}")
 
 
+@app.get("/products/{product_id}/variants")
+def get_product_variants(product_id: int):
+    return forward_request("GET", f"/products/{product_id}/variants")
+
+
+@app.post("/products/{product_id}/variants", status_code=201)
+def create_product_variant(product_id: int, variant: ProductVariantCreate):
+    return forward_request(
+        "POST",
+        f"/products/{product_id}/variants",
+        json=variant.model_dump()
+    )
+
+
+@app.put("/products/{product_id}/variants/{variant_id}")
+def update_product_variant(
+    product_id: int,
+    variant_id: int,
+    variant: ProductVariantUpdate
+):
+    return forward_request(
+        "PUT",
+        f"/products/{product_id}/variants/{variant_id}",
+        json=variant.model_dump(exclude_unset=True)
+    )
+
+
+@app.delete("/products/{product_id}/variants/{variant_id}")
+def delete_product_variant(product_id: int, variant_id: int):
+    return forward_request(
+        "DELETE",
+        f"/products/{product_id}/variants/{variant_id}"
+    )
+
+
 # ---------------------- Orders ----------------------
 
 @app.post("/orders", status_code=201)
@@ -251,6 +385,11 @@ def get_orders(
 @app.get("/orders/{order_id}")
 def get_order(order_id: int = Path(gt=0)):
     return forward_order_request("GET", f"/orders/{order_id}")
+
+
+@app.delete("/orders/{order_id}")
+def delete_order(order_id: int = Path(gt=0)):
+    return forward_order_request("DELETE", f"/orders/{order_id}")
 
 
 @app.patch("/orders/{order_id}/status")

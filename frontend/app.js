@@ -9,22 +9,25 @@ const API_BASE = isLocalDirect ? 'http://127.0.0.1:8000' : '/api';
 const STORAGE_BASE = isLocalDirect ? 'http://127.0.0.1:8000' : '';
 const FALLBACK_IMAGE = 'https://placehold.co/400x400/f1f5f9/64748b?text=Shoe+Store';
 
-// Allowed Order Transitions
-const ALLOWED_ORDER_TRANSITIONS = {
-  PENDING: ['CONFIRMED', 'CANCELLED'],
-  CONFIRMED: ['PROCESSING', 'CANCELLED'],
-  PROCESSING: ['SHIPPING', 'CANCELLED'],
-  SHIPPING: ['DELIVERED'],
-  DELIVERED: [],
-  CANCELLED: [],
+const ORDER_STATUS_LABELS = {
+  PENDING: 'Chờ duyệt',
+  CONFIRMED: 'Đã xác nhận',
+  PROCESSING: 'Đang xử lý',
+  SHIPPING: 'Đang giao hàng',
+  DELIVERED: 'Đã hoàn thành',
+  CANCELLED: 'Đã hủy',
 };
 
 // Global State
 const state = {
-  activeTab: 'dashboard', // 'dashboard' | 'products' | 'categories' | 'orders'
+  activeTab: 'dashboard', // 'dashboard' | 'products' | 'categories' | 'orders' | 'users'
   products: [],
   categories: [],
   orders: [],
+  users: [],
+  usersLoadError: false,
+  accessToken: sessionStorage.getItem('shoe-store-access-token') || '',
+  authUser: null,
   isLoading: false,
   isServiceHealthy: null,
   
@@ -34,10 +37,12 @@ const state = {
   categorySearch: '',
   orderSearch: '',
   orderStatusFilter: 'ALL',
+  userSearch: '',
 
   // Modals & Forms
   productModal: { isOpen: false, isEditing: false, data: null },
   categoryModal: { isOpen: false, isEditing: false, data: null },
+  userModal: { isOpen: false, isEditing: false, data: null },
   orderDetailModal: { isOpen: false, data: null },
   confirmModal: { isOpen: false, title: '', message: '', onConfirm: null },
 
@@ -117,7 +122,11 @@ function renderToasts() {
 async function apiRequest(endpoint, options = {}) {
   try {
     const url = endpoint.startsWith('http') ? endpoint : `${API_BASE}${endpoint}`;
-    const res = await fetch(url, options);
+    const headers = new Headers(options.headers || {});
+    if (state.accessToken) {
+      headers.set('Authorization', `Bearer ${state.accessToken}`);
+    }
+    const res = await fetch(url, { ...options, headers });
     if (!res.ok) {
       let errText = `Lỗi máy chủ (${res.status})`;
       try {
@@ -140,16 +149,23 @@ async function loadAllData() {
   state.isLoading = true;
   renderApp();
   try {
-    const [products, categories, orders, health] = await Promise.allSettled([
+    const [products, categories, orders, users, health] = await Promise.allSettled([
       apiRequest('/products?limit=500'),
       apiRequest('/categories?limit=500'),
       apiRequest('/orders?limit=500'),
+      apiRequest('/users?limit=500'),
       apiRequest('/health'),
     ]);
 
     if (products.status === 'fulfilled') state.products = products.value;
     if (categories.status === 'fulfilled') state.categories = categories.value;
     if (orders.status === 'fulfilled') state.orders = orders.value;
+    if (users.status === 'fulfilled') {
+      state.users = users.value;
+      state.usersLoadError = false;
+    } else {
+      state.usersLoadError = true;
+    }
     state.isServiceHealthy = health.status === 'fulfilled' && health.value?.status === 'ok';
 
   } catch (err) {
@@ -163,21 +179,63 @@ async function loadAllData() {
 // Order Status Badge Component
 function getStatusBadge(status) {
   const map = {
-    PENDING: { label: 'Chờ duyệt', color: 'bg-amber-50 text-amber-700 border-amber-200' },
-    CONFIRMED: { label: 'Đã xác nhận', color: 'bg-blue-50 text-blue-700 border-blue-200' },
-    PROCESSING: { label: 'Đang xử lý', color: 'bg-sky-50 text-sky-700 border-sky-200' },
-    SHIPPING: { label: 'Đang giao hàng', color: 'bg-purple-50 text-purple-700 border-purple-200' },
-    DELIVERED: { label: 'Đã hoàn thành', color: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
-    CANCELLED: { label: 'Đã hủy', color: 'bg-rose-50 text-rose-700 border-rose-200' },
+    PENDING: 'bg-amber-50 text-amber-700 border-amber-200',
+    CONFIRMED: 'bg-blue-50 text-blue-700 border-blue-200',
+    PROCESSING: 'bg-sky-50 text-sky-700 border-sky-200',
+    SHIPPING: 'bg-purple-50 text-purple-700 border-purple-200',
+    DELIVERED: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+    CANCELLED: 'bg-rose-50 text-rose-700 border-rose-200',
   };
-  const s = map[status] || { label: status, color: 'bg-zinc-100 text-zinc-700 border-zinc-200' };
-  return `<span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border ${s.color}">${s.label} (${status})</span>`;
+  const label = ORDER_STATUS_LABELS[status] || status;
+  const color = map[status] || 'bg-zinc-100 text-zinc-700 border-zinc-200';
+  return `<span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border ${color}">${label} (${status})</span>`;
 }
 
 // Category Lookup Helper
 function getCategoryName(categoryId) {
   const cat = state.categories.find(c => c.id === categoryId);
   return cat ? cat.name : 'Chưa phân loại';
+}
+
+function renderLoginScreen() {
+  const isCustomer = state.authUser?.role === 'CUSTOMER';
+  document.getElementById('app').innerHTML = `
+    <main class="min-h-screen grid place-items-center bg-[#f8f9fa] p-4">
+      <div class="w-full max-w-md bg-white rounded-2xl border border-zinc-200 shadow-sm p-8">
+        <div class="w-12 h-12 rounded-xl bg-zinc-900 text-white grid place-items-center text-xl mx-auto">
+          <i class="fas fa-shoe-prints"></i>
+        </div>
+        <h1 class="text-xl font-bold text-zinc-900 text-center mt-4">SHOE STORE</h1>
+        <p class="text-sm text-zinc-500 text-center mt-1">
+          ${isCustomer ? 'Tài khoản khách hàng không có quyền vào trang quản trị.' : 'Đăng nhập quản trị'}
+        </p>
+        ${isCustomer ? `
+          <button onclick="logout()" class="w-full mt-6 px-4 py-2.5 rounded-xl bg-zinc-900 text-white font-semibold">
+            Đăng xuất
+          </button>
+        ` : `
+          <form onsubmit="handleLoginSubmit(event)" class="mt-6 space-y-4">
+            <div>
+              <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Username</label>
+              <input name="username" autocomplete="username" required minlength="3"
+                class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900">
+            </div>
+            <div>
+              <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Mật khẩu</label>
+              <input name="password" type="password" autocomplete="current-password" required
+                class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900">
+            </div>
+            <button id="login-submit-btn" type="submit"
+              class="w-full px-4 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white text-sm font-semibold">
+              Đăng nhập
+            </button>
+          </form>
+        `}
+      </div>
+    </main>
+    <div id="toast-container" class="fixed top-5 right-5 z-50 pointer-events-none flex flex-col items-end"></div>
+  `;
+  renderToasts();
 }
 
 // --- VIEWS ---
@@ -606,6 +664,119 @@ function renderCategoriesView() {
   `;
 }
 
+function renderUsersView() {
+  const query = state.userSearch.trim().toLowerCase();
+  const filtered = state.users.filter(user =>
+    !query ||
+    user.full_name.toLowerCase().includes(query) ||
+    user.username.toLowerCase().includes(query) ||
+    user.email.toLowerCase().includes(query) ||
+    (user.phone || '').toLowerCase().includes(query) ||
+    user.public_code.toLowerCase().includes(query) ||
+    String(user.id) === query
+  );
+
+  return `
+    <div class="space-y-6">
+      ${state.usersLoadError ? `
+        <div class="flex items-center justify-between gap-4 p-4 rounded-xl border border-amber-200 bg-amber-50 text-sm text-amber-800">
+          <span><i class="fas fa-exclamation-triangle mr-2"></i>Không thể tải danh sách người dùng. Hãy kiểm tra User Service.</span>
+          <button onclick="loadAllData()" class="shrink-0 font-semibold underline">Thử lại</button>
+        </div>
+      ` : ''}
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 bg-white p-5 rounded-2xl border border-zinc-200 shadow-sm">
+        <div class="relative min-w-[240px] flex-1 max-w-md">
+          <i class="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-400 text-sm"></i>
+          <input
+            type="text"
+            placeholder="Tìm theo tên, email, số điện thoại hoặc ID..."
+            value="${escapeHtml(state.userSearch)}"
+            oninput="handleUserSearch(this.value)"
+            class="w-full pl-10 pr-4 py-2 text-sm rounded-xl border border-zinc-200 bg-zinc-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900 transition"
+          >
+        </div>
+        <button
+          onclick="openUserModal()"
+          class="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white text-sm font-semibold shadow-sm transition"
+        >
+          <i class="fas fa-user-plus"></i> Thêm người dùng
+        </button>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-zinc-200 shadow-sm overflow-hidden">
+        <div class="p-4 border-b border-zinc-100 flex items-center justify-between">
+          <h3 class="font-bold text-zinc-900 text-sm">
+            Danh sách người dùng
+            <span class="text-zinc-400 font-normal">(${filtered.length} / ${state.users.length})</span>
+          </h3>
+          <button
+            onclick="loadAllData()"
+            class="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-xl border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 text-zinc-700 transition"
+          >
+            <i class="fas fa-sync-alt"></i> Làm mới
+          </button>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="admin-table">
+            <thead>
+              <tr>
+                <th>Mã người dùng</th>
+                <th>Họ và tên</th>
+                <th>Username</th>
+                <th>Email</th>
+                <th>Vai trò</th>
+                <th>Số điện thoại</th>
+                <th>Địa chỉ</th>
+                <th class="text-right">Thao tác</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.map(user => `
+                <tr>
+                  <td class="font-bold text-zinc-900">${escapeHtml(user.public_code)}</td>
+                  <td class="font-semibold text-zinc-900">${escapeHtml(user.full_name)}</td>
+                  <td>${escapeHtml(user.username)}</td>
+                  <td>${escapeHtml(user.email)}</td>
+                  <td>
+                    <span class="inline-flex px-2 py-1 rounded-full text-xs font-semibold ${
+                      user.role === 'ADMIN'
+                        ? 'bg-purple-50 text-purple-700'
+                        : 'bg-blue-50 text-blue-700'
+                    }">${user.role === 'ADMIN' ? 'Quản trị viên' : 'Khách hàng'}</span>
+                  </td>
+                  <td>${escapeHtml(user.phone || '—')}</td>
+                  <td class="max-w-xs">
+                    <p class="text-xs text-zinc-600 line-clamp-2">${escapeHtml(user.address || 'Chưa có địa chỉ')}</p>
+                  </td>
+                  <td class="text-right whitespace-nowrap">
+                    <button
+                      onclick="editUser(${user.id})"
+                      class="p-2 text-zinc-600 hover:text-black rounded-lg hover:bg-zinc-100 text-sm transition"
+                      title="Chỉnh sửa"
+                    ><i class="fas fa-edit"></i></button>
+                    <button
+                      onclick="confirmDeleteUser(${user.id})"
+                      class="p-2 text-rose-600 hover:text-rose-800 rounded-lg hover:bg-rose-50 text-sm transition ml-1"
+                      title="Xóa người dùng"
+                    ><i class="fas fa-trash-alt"></i></button>
+                  </td>
+                </tr>
+              `).join('') || `
+                <tr>
+                  <td colspan="8" class="text-center py-12 text-zinc-400 text-sm">
+                    <i class="fas fa-users text-3xl mb-2 text-zinc-300 block"></i>
+                    ${state.users.length ? 'Không tìm thấy người dùng phù hợp' : 'Chưa có người dùng nào'}
+                  </td>
+                </tr>
+              `}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // 4. Orders View
 function renderOrdersView() {
   const statuses = ['ALL', 'PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPING', 'DELIVERED', 'CANCELLED'];
@@ -700,6 +871,15 @@ function renderOrdersView() {
                     >
                       Chi tiết <i class="fas fa-chevron-right ml-1"></i>
                     </button>
+                    ${o.status === 'CANCELLED' ? `
+                      <button
+                        onclick="confirmDeleteOrder(${o.id})"
+                        class="ml-1 px-3 py-1.5 rounded-xl border border-rose-200 text-rose-700 hover:bg-rose-50 text-xs font-semibold transition"
+                        title="Xóa đơn hàng đã hủy"
+                      >
+                        <i class="fas fa-trash-alt"></i>
+                      </button>
+                    ` : ''}
                   </td>
                 </tr>
               `).join('') || `
@@ -722,6 +902,10 @@ function renderOrdersView() {
 function renderApp() {
   const appContainer = document.getElementById('app');
   if (!appContainer) return;
+  if (!state.authUser || state.authUser.role !== 'ADMIN') {
+    renderLoginScreen();
+    return;
+  }
 
   appContainer.innerHTML = `
     <div class="min-h-screen flex flex-col md:flex-row bg-[#f8f9fa]">
@@ -798,6 +982,21 @@ function renderApp() {
               state.activeTab === 'orders' ? 'bg-zinc-700 text-white' : 'bg-zinc-100 text-zinc-600'
             }">${state.orders.length}</span>
           </button>
+
+            <button
+              onclick="switchTab('users')"
+              class="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition ${
+                state.activeTab === 'users'
+                  ? 'bg-zinc-900 text-white shadow-sm'
+                  : 'text-zinc-600 hover:bg-zinc-100 hover:text-black'
+              }"
+            >
+              <i class="fas fa-users w-5 text-center"></i>
+              <span>Người dùng</span>
+              <span class="ml-auto text-xs px-2 py-0.5 rounded-full ${
+                state.activeTab === 'users' ? 'bg-zinc-700 text-white' : 'bg-zinc-100 text-zinc-600'
+              }">${state.users.length}</span>
+            </button>
         </nav>
 
         <!-- Service Status & Admin Info -->
@@ -810,10 +1009,13 @@ function renderApp() {
               alt="Avatar"
             >
             <div class="min-w-0 flex-1">
-              <div class="font-bold text-xs text-zinc-900 truncate">Admin</div>
-              <div class="text-[11px] text-zinc-400">Administrator</div>
+              <div class="font-bold text-xs text-zinc-900 truncate">${escapeHtml(state.authUser.full_name)}</div>
+              <div class="text-[11px] text-zinc-400">${escapeHtml(state.authUser.username)} · ADMIN</div>
             </div>
           </div>
+          <button onclick="logout()" class="w-full px-3 py-2 rounded-lg text-xs font-semibold text-zinc-600 hover:bg-zinc-100 hover:text-black text-left">
+            <i class="fas fa-sign-out-alt mr-2"></i>Đăng xuất
+          </button>
         </div>
       </aside>
 
@@ -823,6 +1025,7 @@ function renderApp() {
         ${state.activeTab === 'products' ? renderProductsView() : ''}
         ${state.activeTab === 'categories' ? renderCategoriesView() : ''}
         ${state.activeTab === 'orders' ? renderOrdersView() : ''}
+        ${state.activeTab === 'users' ? renderUsersView() : ''}
       </main>
     </div>
 
@@ -830,6 +1033,7 @@ function renderApp() {
     <div id="modal-container">
       ${renderProductModal()}
       ${renderCategoryModal()}
+      ${renderUserModal()}
       ${renderOrderDetailModal()}
       ${renderConfirmModal()}
     </div>
@@ -874,6 +1078,49 @@ window.handleOrderStatusFilter = function(st) {
   if (state.activeTab === 'orders') renderApp();
 };
 
+window.handleUserSearch = function(value) {
+  state.userSearch = value;
+  if (state.activeTab === 'users') renderApp();
+};
+
+window.handleLoginSubmit = async function(event) {
+  event.preventDefault();
+  const form = event.target;
+  const submitButton = document.getElementById('login-submit-btn');
+  submitButton.disabled = true;
+
+  try {
+    const result = await apiRequest('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: form.username.value.trim(),
+        password: form.password.value,
+      }),
+    });
+    state.accessToken = result.access_token;
+    sessionStorage.setItem('shoe-store-access-token', state.accessToken);
+    state.authUser = result.user;
+    if (state.authUser.role !== 'ADMIN') {
+      showToast('Tài khoản này không có quyền quản trị.', 'error');
+    }
+    renderApp();
+    if (state.authUser.role === 'ADMIN') await loadAllData();
+  } catch (error) {
+    showToast(error.message || 'Đăng nhập thất bại', 'error');
+  } finally {
+    if (submitButton.isConnected) submitButton.disabled = false;
+  }
+};
+
+window.logout = function() {
+  state.accessToken = '';
+  state.authUser = null;
+  sessionStorage.removeItem('shoe-store-access-token');
+  state.users = [];
+  renderApp();
+};
+
 // --- PRODUCT MODAL ---
 window.openProductModal = function() {
   state.productModal = {
@@ -884,15 +1131,20 @@ window.openProductModal = function() {
   renderApp();
 };
 
-window.editProduct = function(productId) {
+window.editProduct = async function(productId) {
   const p = state.products.find(item => item.id === productId);
   if (!p) return;
-  state.productModal = {
-    isOpen: true,
-    isEditing: true,
-    data: { ...p }
-  };
-  renderApp();
+  try {
+    const variants = await apiRequest(`/products/${productId}/variants`);
+    state.productModal = {
+      isOpen: true,
+      isEditing: true,
+      data: { ...p, variants }
+    };
+    renderApp();
+  } catch (error) {
+    showToast(error.message || 'Không thể tải size sản phẩm', 'error');
+  }
 };
 
 window.closeProductModal = function() {
@@ -931,7 +1183,7 @@ function renderProductModal() {
             >
           </div>
 
-          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Danh mục *</label>
               <select 
@@ -946,33 +1198,66 @@ function renderProductModal() {
                 `).join('')}
               </select>
             </div>
-
             <div>
               <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Giá bán ($) *</label>
-              <input 
-                type="number" 
-                name="price" 
-                step="0.01" 
-                min="0" 
-                required 
-                value="${escapeHtml(data.price)}"
-                placeholder="0.00"
-                class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
-              >
+              <input type="number" name="price" step="0.01" min="0" required value="${escapeHtml(data.price)}"
+                class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900">
             </div>
+          </div>
 
-            <div>
-              <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Tồn kho *</label>
-              <input 
-                type="number" 
-                name="stock" 
-                min="0" 
-                required 
-                value="${escapeHtml(data.stock)}"
-                placeholder="10"
-                class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
-              >
-            </div>
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Size và tồn kho theo size</label>
+            ${isEditing ? `
+              <div class="space-y-2">
+                ${(data.variants || []).map(variant => `
+                  <div class="flex items-center gap-2">
+                    <input
+                      id="variant-size-${variant.id}"
+                      type="text"
+                      value="${escapeHtml(variant.size)}"
+                      aria-label="Size"
+                      class="w-24 px-3 py-2 text-sm rounded-lg border border-zinc-200"
+                    >
+                    <input
+                      id="variant-stock-${variant.id}"
+                      type="number"
+                      min="0"
+                      value="${variant.stock}"
+                      aria-label="Tồn kho size"
+                      class="w-28 px-3 py-2 text-sm rounded-lg border border-zinc-200"
+                    >
+                    <button
+                      type="button"
+                      onclick="saveProductVariant(${data.id}, ${variant.id})"
+                      class="px-3 py-2 rounded-lg bg-zinc-100 hover:bg-zinc-200 text-xs font-semibold"
+                    >Lưu</button>
+                    <button
+                      type="button"
+                      onclick="removeProductVariant(${data.id}, ${variant.id})"
+                      class="px-3 py-2 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-semibold"
+                    >Xóa</button>
+                  </div>
+                `).join('') || '<p class="text-xs text-zinc-500">Sản phẩm chưa có size.</p>'}
+                <div class="flex items-center gap-2 pt-1">
+                  <input id="new-variant-size" type="text" maxlength="20" placeholder="Size mới (ví dụ: 38)"
+                    class="w-36 px-3 py-2 text-sm rounded-lg border border-zinc-200">
+                  <input id="new-variant-stock" type="number" min="0" value="0" aria-label="Tồn kho size mới"
+                    class="w-28 px-3 py-2 text-sm rounded-lg border border-zinc-200">
+                  <button type="button" onclick="addProductVariant(${data.id})"
+                    class="px-3 py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-semibold">
+                    Thêm size
+                  </button>
+                </div>
+                <p class="text-xs text-zinc-500">Tổng tồn kho sản phẩm được tính từ tồn kho của các size.</p>
+              </div>
+            ` : `
+              <div class="grid grid-cols-2 gap-3">
+                <input name="initial_size" type="text" maxlength="20" required placeholder="Size (ví dụ: 38)"
+                  class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900">
+                <input name="initial_stock" type="number" min="0" value="0" required placeholder="Tồn kho"
+                  class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900">
+              </div>
+            `}
           </div>
 
           <!-- Image Selection -->
@@ -1067,6 +1352,10 @@ window.handleProductSubmit = async function(event) {
     const file = formData.get('image');
     const isEditing = state.productModal.isEditing;
     const productId = state.productModal.data?.id;
+    const initialVariant = isEditing ? null : {
+      size: formData.get('initial_size').trim(),
+      stock: parseInt(formData.get('initial_stock'), 10),
+    };
 
     // Use FormData if file is selected, else plain JSON
     let body;
@@ -1077,7 +1366,7 @@ window.handleProductSubmit = async function(event) {
       const payload = {
         name: formData.get('name'),
         price: parseFloat(formData.get('price')),
-        stock: parseInt(formData.get('stock')),
+        ...(isEditing ? {} : { stock: 0 }),
         category_id: parseInt(formData.get('category_id')),
         description: formData.get('description'),
         image_url: formData.get('image_url') || null,
@@ -1089,7 +1378,21 @@ window.handleProductSubmit = async function(event) {
     const endpoint = isEditing ? `/products/${productId}` : '/products';
     const method = isEditing ? 'PUT' : 'POST';
 
-    await apiRequest(endpoint, { method, headers, body });
+    const savedProduct = await apiRequest(endpoint, { method, headers, body });
+    if (!isEditing) {
+      try {
+        await apiRequest(`/products/${savedProduct.id}/variants`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(initialVariant),
+        });
+      } catch (error) {
+        closeProductModal();
+        await loadAllData();
+        showToast(`Sản phẩm đã tạo nhưng chưa lưu được size: ${error.message}`, 'error');
+        return;
+      }
+    }
     showToast(isEditing ? 'Cập nhật sản phẩm thành công!' : 'Tạo sản phẩm mới thành công!', 'success');
     closeProductModal();
     await loadAllData();
@@ -1097,6 +1400,65 @@ window.handleProductSubmit = async function(event) {
     showToast(error.message || 'Lỗi khi lưu sản phẩm', 'error');
   } finally {
     submitBtn.disabled = false;
+  }
+};
+
+window.addProductVariant = async function(productId) {
+  const sizeInput = document.getElementById('new-variant-size');
+  const stockInput = document.getElementById('new-variant-stock');
+  const size = sizeInput.value.trim();
+
+  if (!size) {
+    showToast('Vui lòng nhập size giày', 'error');
+    return;
+  }
+
+  try {
+    await apiRequest(`/products/${productId}/variants`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ size, stock: parseInt(stockInput.value, 10) }),
+    });
+    const variants = await apiRequest(`/products/${productId}/variants`);
+    state.productModal.data.variants = variants;
+    await loadAllData();
+  } catch (error) {
+    showToast(error.message || 'Không thể thêm size', 'error');
+  }
+};
+
+window.saveProductVariant = async function(productId, variantId) {
+  const size = document.getElementById(`variant-size-${variantId}`).value.trim();
+  const stock = parseInt(document.getElementById(`variant-stock-${variantId}`).value, 10);
+  if (!size || !Number.isInteger(stock) || stock < 0) {
+    showToast('Size không được để trống và tồn kho phải từ 0 trở lên', 'error');
+    return;
+  }
+
+  try {
+    await apiRequest(`/products/${productId}/variants/${variantId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ size, stock }),
+    });
+    state.productModal.data.variants = await apiRequest(`/products/${productId}/variants`);
+    await loadAllData();
+    showToast('Đã cập nhật size và tồn kho', 'success');
+  } catch (error) {
+    showToast(error.message || 'Không thể cập nhật size', 'error');
+  }
+};
+
+window.removeProductVariant = async function(productId, variantId) {
+  try {
+    await apiRequest(`/products/${productId}/variants/${variantId}`, {
+      method: 'DELETE',
+    });
+    state.productModal.data.variants = await apiRequest(`/products/${productId}/variants`);
+    await loadAllData();
+    showToast('Đã xóa size sản phẩm', 'success');
+  } catch (error) {
+    showToast(error.message || 'Không thể xóa size', 'error');
   }
 };
 
@@ -1262,6 +1624,230 @@ window.confirmDeleteCategory = function(catId, catName, productCount) {
   renderApp();
 };
 
+// --- USER MANAGEMENT ---
+window.openUserModal = function() {
+  state.userModal = {
+    isOpen: true,
+    isEditing: false,
+    data: { full_name: '', username: '', email: '', phone: '', address: '', role: 'CUSTOMER' },
+  };
+  renderApp();
+};
+
+window.editUser = function(userId) {
+  const user = state.users.find(item => item.id === userId);
+  if (!user) return;
+
+  state.userModal = {
+    isOpen: true,
+    isEditing: true,
+    data: { ...user },
+  };
+  renderApp();
+};
+
+window.closeUserModal = function() {
+  state.userModal.isOpen = false;
+  renderApp();
+};
+
+function renderUserModal() {
+  const { isOpen, isEditing, data } = state.userModal;
+  if (!isOpen || !data) return '';
+
+  return `
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
+      <div class="bg-white rounded-2xl border border-zinc-200 shadow-2xl w-full max-w-lg overflow-hidden modal-content">
+        <div class="p-5 border-b border-zinc-100 flex items-center justify-between">
+          <h3 class="font-bold text-lg text-zinc-900">
+          ${isEditing ? `Chỉnh sửa người dùng ${escapeHtml(data.public_code)}` : 'Thêm người dùng'}
+          </h3>
+          <button onclick="closeUserModal()" class="w-8 h-8 rounded-lg text-zinc-400 hover:text-black hover:bg-zinc-100 grid place-items-center">
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
+
+        <form onsubmit="handleUserSubmit(event)" class="p-6 space-y-4">
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Họ và tên *</label>
+            <input
+              name="full_name"
+              type="text"
+              maxlength="200"
+              required
+              value="${escapeHtml(data.full_name)}"
+              class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+            >
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Username *</label>
+            <input
+              name="username"
+              type="text"
+              minlength="3"
+              maxlength="50"
+              pattern="[A-Za-z0-9_.-]+"
+              required
+              value="${escapeHtml(data.username)}"
+              class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+            >
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">
+              Mật khẩu ${isEditing ? '(để trống nếu không đổi)' : '*'}
+            </label>
+            <input
+              name="password"
+              type="password"
+              minlength="8"
+              maxlength="128"
+              ${isEditing ? '' : 'required'}
+              autocomplete="new-password"
+              class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+            >
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Email *</label>
+            <input
+              name="email"
+              type="email"
+              maxlength="254"
+              required
+              value="${escapeHtml(data.email)}"
+              class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+            >
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Vai trò *</label>
+            <select name="role" required
+              class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900">
+              <option value="CUSTOMER" ${data.role === 'CUSTOMER' ? 'selected' : ''}>Khách hàng</option>
+              <option value="ADMIN" ${data.role === 'ADMIN' ? 'selected' : ''}>Quản trị viên</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Số điện thoại</label>
+            <input
+              name="phone"
+              type="tel"
+              maxlength="30"
+              value="${escapeHtml(data.phone || '')}"
+              class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+            >
+          </div>
+          <div>
+            <label class="block text-xs font-bold text-zinc-700 uppercase mb-1">Địa chỉ</label>
+            <textarea
+              name="address"
+              rows="3"
+              maxlength="500"
+              class="w-full px-3.5 py-2.5 text-sm rounded-xl border border-zinc-200 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+            >${escapeHtml(data.address || '')}</textarea>
+          </div>
+          <div class="pt-4 border-t border-zinc-100 flex items-center justify-end gap-3">
+            <button
+              type="button"
+              onclick="closeUserModal()"
+              class="px-4 py-2 text-sm font-semibold text-zinc-600 hover:text-black rounded-xl hover:bg-zinc-100 transition"
+            >Hủy</button>
+            <button
+              type="submit"
+              id="user-submit-btn"
+              class="px-5 py-2.5 text-sm font-semibold text-white bg-zinc-900 hover:bg-zinc-800 rounded-xl shadow-sm transition inline-flex items-center gap-2"
+            >
+              <i class="fas fa-save"></i> ${isEditing ? 'Lưu thay đổi' : 'Tạo người dùng'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+window.handleUserSubmit = async function(event) {
+  event.preventDefault();
+  const form = event.target;
+  const submitButton = document.getElementById('user-submit-btn');
+  submitButton.disabled = true;
+
+  const isEditing = state.userModal.isEditing;
+  const userId = state.userModal.data?.id;
+  const payload = {
+    full_name: form.full_name.value.trim(),
+    username: form.username.value.trim(),
+    email: form.email.value.trim(),
+    role: form.role.value,
+    phone: form.phone.value.trim() || null,
+    address: form.address.value.trim() || null,
+  };
+  const password = form.password.value;
+  if (password) payload.password = password;
+
+  try {
+    await apiRequest(isEditing ? `/users/${userId}` : '/users', {
+      method: isEditing ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    showToast(isEditing ? 'Cập nhật người dùng thành công!' : 'Tạo người dùng thành công!', 'success');
+    closeUserModal();
+    await loadAllData();
+  } catch (error) {
+    showToast(error.message || 'Không thể lưu người dùng', 'error');
+  } finally {
+    submitButton.disabled = false;
+  }
+};
+
+window.confirmDeleteUser = function(userId) {
+  const user = state.users.find(item => item.id === userId);
+  if (!user) return;
+
+  state.confirmModal = {
+    isOpen: true,
+    title: 'Xóa người dùng',
+    message: `Bạn có chắc muốn xóa người dùng <b>"${escapeHtml(user.full_name)}"</b> (${escapeHtml(user.email)}) không?`,
+    onConfirm: async () => {
+      try {
+        await apiRequest(`/users/${userId}`, { method: 'DELETE' });
+        showToast('Đã xóa người dùng thành công!', 'success');
+        await loadAllData();
+      } catch (error) {
+        showToast(error.message || 'Không thể xóa người dùng', 'error');
+      }
+    },
+  };
+  renderApp();
+};
+
+window.confirmDeleteOrder = function(orderId) {
+  const order = state.orders.find(item => item.id === orderId);
+  if (!order) {
+    showToast('Không tìm thấy đơn hàng cần xóa', 'error');
+    return;
+  }
+  if (order.status !== 'CANCELLED') {
+    showToast('Chỉ có thể xóa đơn hàng đã hủy', 'error');
+    return;
+  }
+
+  state.confirmModal = {
+    isOpen: true,
+    title: 'Xóa đơn hàng đã hủy',
+    message: `Bạn có chắc muốn xóa vĩnh viễn đơn hàng <b>#${orderId}</b> và toàn bộ chi tiết, lịch sử trạng thái không?`,
+    onConfirm: async () => {
+      try {
+        await apiRequest(`/orders/${orderId}`, { method: 'DELETE' });
+        showToast(`Đã xóa đơn hàng #${orderId}`, 'success');
+        await loadAllData();
+      } catch (error) {
+        showToast(error.message || 'Không thể xóa đơn hàng', 'error');
+      }
+    },
+  };
+  renderApp();
+};
+
 // --- ORDER DETAIL MODAL & STATUS UPDATE ---
 window.openOrderDetail = async function(orderId) {
   try {
@@ -1285,7 +1871,8 @@ function renderOrderDetailModal() {
   const { isOpen, data } = state.orderDetailModal;
   if (!isOpen || !data) return '';
 
-  const allowedTransitions = ALLOWED_ORDER_TRANSITIONS[data.status] || [];
+  const availableStatuses = Object.keys(ORDER_STATUS_LABELS)
+    .filter(status => status !== data.status);
 
   return `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop">
@@ -1355,11 +1942,11 @@ function renderOrderDetailModal() {
           <!-- Status Transitions Controller -->
           <div class="p-4 rounded-xl border border-zinc-200 bg-white space-y-3">
             <h4 class="font-bold text-zinc-900">Cập nhật trạng thái đơn hàng</h4>
-            ${allowedTransitions.length > 0 ? `
+            ${availableStatuses.length > 0 ? `
               <form onsubmit="handleOrderStatusUpdate(event, ${data.id})" class="flex flex-wrap items-center gap-3">
                 <select name="status" class="px-3.5 py-2 text-sm rounded-xl border border-zinc-200 bg-zinc-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900 font-semibold">
-                  ${allowedTransitions.map(st => `
-                    <option value="${st}">Chuyển sang: ${st}</option>
+                  ${availableStatuses.map(status => `
+                    <option value="${status}">Chuyển sang: ${ORDER_STATUS_LABELS[status]} (${status})</option>
                   `).join('')}
                 </select>
                 <button type="submit" id="update-status-btn" class="px-4 py-2 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white text-sm font-semibold shadow-sm transition">
@@ -1470,14 +2057,26 @@ document.addEventListener('click', (e) => {
   }
 });
 
-// Initialization
-document.addEventListener('DOMContentLoaded', () => {
-  renderApp();
-  loadAllData();
-});
+async function initializeApp() {
+  if (state.accessToken) {
+    try {
+      state.authUser = await apiRequest('/auth/me');
+      if (state.authUser.role !== 'ADMIN') {
+        renderApp();
+        return;
+      }
+    } catch {
+      state.accessToken = '';
+      sessionStorage.removeItem('shoe-store-access-token');
+    }
+  }
 
-// If loaded after DOMContentLoaded
-if (document.readyState === 'complete' || document.readyState === 'interactive') {
   renderApp();
-  loadAllData();
+  if (state.authUser?.role === 'ADMIN') await loadAllData();
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeApp, { once: true });
+} else {
+  initializeApp();
 }

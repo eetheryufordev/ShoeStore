@@ -6,11 +6,13 @@ from sqlalchemy.orm import Session
 
 from category_service.database import get_db
 from category_service import models, schemas
+from user_service.security import require_role
 
 app = FastAPI(
     title="ShoeStore Category Service",
     description="API quan ly danh muc giay",
     version="1.0.0",
+    dependencies=[Depends(require_role)],
 )
 
 

@@ -2,7 +2,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ProductCreate(BaseModel):
@@ -35,5 +35,35 @@ class ProductResponse(BaseModel):
     image_url: str | None
     description: str | None
     category_id: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ProductVariantBase(BaseModel):
+    size: str = Field(min_length=1, max_length=20)
+    stock: int = Field(default=0, ge=0)
+
+    @field_validator("size", mode="before")
+    @classmethod
+    def normalize_numeric_size(cls, value):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        return value
+
+
+class ProductVariantCreate(ProductVariantBase):
+    pass
+
+
+class ProductVariantUpdate(BaseModel):
+    size: str | None = Field(default=None, min_length=1, max_length=20)
+    stock: int | None = Field(default=None, ge=0)
+
+
+class ProductVariantResponse(ProductVariantBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    product_id: int
     created_at: datetime | None = None
     updated_at: datetime | None = None

@@ -1,15 +1,17 @@
 
 from fastapi import FastAPI, Depends, HTTPException, status
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from product_service.database import get_db
 from product_service import models, schemas
+from user_service.security import require_role
 
 app = FastAPI(
     title="ShoeStore Product Service",
     description="API quan ly san pham giay",
     version="1.0.0",
+    dependencies=[Depends(require_role)],
 )
 
 
@@ -39,6 +41,37 @@ def get_product_or_404(db: Session, product_id: int):
         )
 
     return product
+
+
+def get_variant_or_404(db: Session, product_id: int, variant_id: int):
+    variant = (
+        db.query(models.ProductVariant)
+        .filter(
+            models.ProductVariant.id == variant_id,
+            models.ProductVariant.product_id == product_id,
+        )
+        .first()
+    )
+
+    if variant is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Khong tim thay size giay",
+        )
+
+    return variant
+
+
+def sync_product_stock(db: Session, product_id: int):
+    product = get_product_or_404(db, product_id)
+    total_stock = (
+        db.query(func.coalesce(func.sum(models.ProductVariant.stock), 0))
+        .filter(models.ProductVariant.product_id == product_id)
+        .scalar()
+        or 0
+    )
+    product.stock = int(total_stock)
+    db.add(product)
 
 
 def check_category(db: Session, category_id: int):
@@ -81,6 +114,30 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
     return get_product_or_404(db, product_id)
 
 
+# 2.1. Lay danh sach size cua san pham
+@app.get(
+    "/products/{product_id}/variants",
+    response_model=list[schemas.ProductVariantResponse],
+)
+def get_product_variants(product_id: int, db: Session = Depends(get_db)):
+    get_product_or_404(db, product_id)
+    return (
+        db.query(models.ProductVariant)
+        .filter(models.ProductVariant.product_id == product_id)
+        .order_by(models.ProductVariant.size)
+        .all()
+    )
+
+
+@app.get(
+    "/products/{product_id}/variants/{variant_id}",
+    response_model=schemas.ProductVariantResponse,
+)
+def get_product_variant(product_id: int, variant_id: int, db: Session = Depends(get_db)):
+    get_product_or_404(db, product_id)
+    return get_variant_or_404(db, product_id, variant_id)
+
+
 # 3. Them san pham
 @app.post(
     "/products",
@@ -105,6 +162,61 @@ def create_product(
         raise HTTPException(
             status_code=500,
             detail="Khong the them san pham",
+        )
+
+
+# 3.1. Them size cho san pham
+@app.post(
+    "/products/{product_id}/variants",
+    response_model=schemas.ProductVariantResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_product_variant(
+    product_id: int,
+    variant_data: schemas.ProductVariantCreate,
+    db: Session = Depends(get_db),
+):
+    get_product_or_404(db, product_id)
+
+    normalized_size = variant_data.size.strip()
+    if not normalized_size:
+        raise HTTPException(
+            status_code=422,
+            detail="Size giay khong duoc de trong",
+        )
+
+    existing_variant = (
+        db.query(models.ProductVariant)
+        .filter(
+            models.ProductVariant.product_id == product_id,
+            models.ProductVariant.size == normalized_size,
+        )
+        .first()
+    )
+    if existing_variant is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Size giay da ton tai cho san pham nay",
+        )
+
+    variant = models.ProductVariant(
+        product_id=product_id,
+        size=normalized_size,
+        stock=variant_data.stock,
+    )
+
+    try:
+        db.add(variant)
+        db.commit()
+        db.refresh(variant)
+        sync_product_stock(db, product_id)
+        db.commit()
+        return variant
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Khong the them size giay",
         )
 
 
@@ -136,6 +248,61 @@ def update_product(
         )
 
 
+@app.put(
+    "/products/{product_id}/variants/{variant_id}",
+    response_model=schemas.ProductVariantResponse,
+)
+def update_product_variant(
+    product_id: int,
+    variant_id: int,
+    variant_data: schemas.ProductVariantUpdate,
+    db: Session = Depends(get_db),
+):
+    get_product_or_404(db, product_id)
+    variant = get_variant_or_404(db, product_id, variant_id)
+    updates = variant_data.model_dump(exclude_unset=True)
+
+    if "size" in updates and updates["size"] is not None:
+        normalized_size = updates["size"].strip()
+        if not normalized_size:
+            raise HTTPException(
+                status_code=422,
+                detail="Size giay khong duoc de trong",
+            )
+        if (
+            normalized_size != variant.size
+            and db.query(models.ProductVariant)
+            .filter(
+                models.ProductVariant.product_id == product_id,
+                models.ProductVariant.size == normalized_size,
+                models.ProductVariant.id != variant_id,
+            )
+            .first()
+            is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Size giay da ton tai cho san pham nay",
+            )
+        updates["size"] = normalized_size
+
+    for field, value in updates.items():
+        setattr(variant, field, value)
+
+    try:
+        db.commit()
+        db.refresh(variant)
+        sync_product_stock(db, product_id)
+        db.commit()
+        return variant
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Khong the cap nhat size giay",
+        )
+
+
 # 5. Xoa san pham
 @app.delete("/products/{product_id}")
 def delete_product(
@@ -156,4 +323,31 @@ def delete_product(
         raise HTTPException(
             status_code=500,
             detail="Khong the xoa san pham",
+        )
+
+
+@app.delete("/products/{product_id}/variants/{variant_id}")
+def delete_product_variant(
+    product_id: int,
+    variant_id: int,
+    db: Session = Depends(get_db),
+):
+    get_product_or_404(db, product_id)
+    variant = get_variant_or_404(db, product_id, variant_id)
+
+    try:
+        db.delete(variant)
+        db.commit()
+        sync_product_stock(db, product_id)
+        db.commit()
+        return {
+            "message": "Xoa size giay thanh cong",
+            "product_id": product_id,
+            "variant_id": variant_id,
+        }
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Khong the xoa size giay",
         )

@@ -2,18 +2,20 @@
 from decimal import Decimal
 from enum import Enum
 
-from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi import Depends, FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from order_service.database import SessionLocal
+from user_service.security import require_role
 
 
 app = FastAPI(
     title="ShoeStore Order Service",
     description="Order management with size-based inventory",
-    version="2.0.0"
+    version="2.0.0",
+    dependencies=[Depends(require_role)],
 )
 
 
@@ -24,25 +26,6 @@ class OrderStatus(str, Enum):
     SHIPPING = "SHIPPING"
     DELIVERED = "DELIVERED"
     CANCELLED = "CANCELLED"
-
-
-ALLOWED_STATUS_TRANSITIONS = {
-    OrderStatus.PENDING: {
-        OrderStatus.CONFIRMED,
-        OrderStatus.CANCELLED,
-    },
-    OrderStatus.CONFIRMED: {
-        OrderStatus.PROCESSING,
-        OrderStatus.CANCELLED,
-    },
-    OrderStatus.PROCESSING: {
-        OrderStatus.SHIPPING,
-        OrderStatus.CANCELLED,
-    },
-    OrderStatus.SHIPPING: {OrderStatus.DELIVERED},
-    OrderStatus.DELIVERED: set(),
-    OrderStatus.CANCELLED: set(),
-}
 
 
 class OrderItemRequest(BaseModel):
@@ -404,6 +387,52 @@ def get_order(order_id: int = Path(gt=0)):
         db.close()
 
 
+@app.delete("/orders/{order_id}")
+def delete_order(order_id: int = Path(gt=0)):
+    db = SessionLocal()
+
+    try:
+        order = db.execute(
+            text("""
+                SELECT status
+                FROM orders
+                WHERE id = :order_id
+                FOR UPDATE
+            """),
+            {"order_id": order_id}
+        ).mappings().first()
+
+        if order is None:
+            raise HTTPException(status_code=404, detail="Khong tim thay don hang")
+
+        if order["status"] != OrderStatus.CANCELLED.value:
+            raise HTTPException(
+                status_code=409,
+                detail="Chi co the xoa don hang da huy"
+            )
+
+        db.execute(
+            text("DELETE FROM orders WHERE id = :order_id"),
+            {"order_id": order_id}
+        )
+        db.commit()
+        return {"message": "Da xoa don hang"}
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Loi database khi xoa don hang"
+        )
+
+    finally:
+        db.close()
+
+
 @app.patch("/orders/{order_id}/status")
 def update_order_status(
     update: OrderStatusUpdate,
@@ -428,30 +457,59 @@ def update_order_status(
         current_status = OrderStatus(order["status"])
         new_status = update.status
 
-        if new_status not in ALLOWED_STATUS_TRANSITIONS[current_status]:
-            allowed_statuses = sorted(
-                status.value
-                for status in ALLOWED_STATUS_TRANSITIONS[current_status]
-            )
+        if new_status == current_status:
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "message": "Khong the chuyen trang thai don hang",
+                    "message": "Don hang dang o trang thai nay",
                     "current_status": current_status.value,
-                    "allowed_statuses": allowed_statuses
                 }
             )
 
-        if new_status == OrderStatus.CANCELLED:
-            db.execute(
+        if current_status == OrderStatus.CANCELLED or new_status == OrderStatus.CANCELLED:
+            items = db.execute(
                 text("""
-                    UPDATE product_variants pv
-                    JOIN order_items oi ON oi.variant_id = pv.id
-                    SET pv.stock = pv.stock + oi.quantity
-                    WHERE oi.order_id = :order_id
+                    SELECT variant_id, SUM(quantity) AS quantity
+                    FROM order_items
+                    WHERE order_id = :order_id
+                    GROUP BY variant_id
+                    ORDER BY variant_id
                 """),
                 {"order_id": order_id}
-            )
+            ).mappings().all()
+
+            for item in items:
+                if current_status == OrderStatus.CANCELLED:
+                    stock_result = db.execute(
+                        text("""
+                            UPDATE product_variants
+                            SET stock = stock - :quantity
+                            WHERE id = :variant_id
+                              AND stock >= :quantity
+                        """),
+                        {
+                            "quantity": item["quantity"],
+                            "variant_id": item["variant_id"]
+                        }
+                    )
+
+                    if stock_result.rowcount != 1:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Khong du ton kho de mo lai don hang"
+                        )
+                else:
+                    db.execute(
+                        text("""
+                            UPDATE product_variants
+                            SET stock = stock + :quantity
+                            WHERE id = :variant_id
+                        """),
+                        {
+                            "quantity": item["quantity"],
+                            "variant_id": item["variant_id"]
+                        }
+                    )
 
         db.execute(
             text("""
